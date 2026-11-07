@@ -112,6 +112,11 @@ button:disabled { cursor: default; }
 .p-uklad { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
 .p-tresc { flex: 1; min-height: 0; }
 .p-sterowanie { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 24px; background: var(--uwaga-t); color: var(--uwaga); font-weight: 700; }
+body.p-podglad .p-sterowanie { position: sticky; top: 0; z-index: 50; font-size: 18px; }
+body.p-podglad #aplikacja { opacity: .55; }
+.p-sterowanie.mrug { animation: p-mrug .6s ease-in-out 2; }
+@keyframes p-mrug { 50% { background: var(--uwaga); color: #fff; } }
+@media (prefers-reduced-motion: reduce) { .p-sterowanie.mrug { animation: none; outline: 4px solid var(--uwaga); } }
 .p-sterowanie .k1-btn.pelny { background: var(--ciem); color: #fff; border-color: var(--ciem); }
 
 /* nagłówek i zakładki (tablet, komputer) */
@@ -1020,6 +1025,7 @@ if (typeof module !== "undefined") {
 /* Łącze na żywo: dwa publiczne serwery MQTT naraz, żeby awaria jednego nie zatrzymała debaty.
    Meta, stan i głosy są „retained”: serwer oddaje ostatnią wersję każdemu, kto dołączy później.
    Kanał sesji to prefiks gd/<sid> (sesja.js); sesja testowa ma własne id, więc własny kanał. */
+const PRZERWA_DO_NOWEGO_POLACZENIA_MS = 10000;
 const BROKERY = ["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt"];
 
 function czytajWiadomosc(temat, bufor) {
@@ -1070,9 +1076,19 @@ function polaczLacze({ prefiks, subskrypcje, naWiadomosc, naStatus, testament })
     });
   }
 
+  /* Uśpiony telefon albo tablet często wraca z martwym połączeniem, które wciąż udaje „połączone”.
+     Po dłuższej przerwie łączymy od nowa: serwer odda zachowany stan, meta i głosy. */
+  let ukrytoOd = null;
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
-    for (const klient of klienci) if (!klient.connected && !klient.reconnecting) klient.reconnect();
+    if (document.visibilityState !== "visible") {
+      ukrytoOd = Date.now();
+      return;
+    }
+    const dlugaPrzerwa = ukrytoOd !== null && Date.now() - ukrytoOd > PRZERWA_DO_NOWEGO_POLACZENIA_MS;
+    ukrytoOd = null;
+    for (const klient of klienci) {
+      if (dlugaPrzerwa || (!klient.connected && !klient.reconnecting)) klient.reconnect();
+    }
   });
 
   function zakoncz() {
@@ -1750,6 +1766,8 @@ const LINK_PROWADZACEGO = daneProwadzacegoZFragmentu(location.hash);
 const KLUCZ_META = kluczPamieci(PAMIEC_META, SID || "bez-sesji");
 /* Po połączeniu czekamy na zachowany stan z serwera, żeby nie nadpisać nowszego starszym. */
 const ODCZEKAJ_MS = 2500;
+const LIMIT_WYSYLKI_MS = 8000;
+const PONOW_WYSYLKE_MS = 3000;
 
 let kluczeSesji = null;
 let paczkaMeta = null;
@@ -1768,10 +1786,21 @@ function wyslijStan() {
   if (!sterowanie.aktywny || !lacze || !stan) return;
   kolejkaStanu = kolejkaStanu.then(async () => {
     const rev = stan.rev;
-    await lacze.publikuj("stan", await podpisz(kluczeSesji.prywatny, stan));
+    if (potwierdzonyRev !== null && potwierdzonyRev >= rev) return;
+    await zLimitemCzasu(lacze.publikuj("stan", await podpisz(kluczeSesji.prywatny, stan)), LIMIT_WYSYLKI_MS);
     potwierdzonyRev = Math.max(potwierdzonyRev || 0, rev);
     rysujPasek();
-  }).catch((blad) => console.warn("Serwer nie przyjął stanu", blad));
+  }).catch((blad) => {
+    console.warn("Serwer nie przyjął stanu, ponawiam", blad);
+    setTimeout(wyslijStan, PONOW_WYSYLKE_MS);
+  });
+}
+
+/* Zerwane połączenie (np. tablet uśpiony w trakcie wysyłki) nie może zatrzymać kolejki na zawsze. */
+function zLimitemCzasu(obietnica, ms) {
+  let zegar;
+  const limit = new Promise((_, odrzuc) => { zegar = setTimeout(() => odrzuc(new Error("Brak potwierdzenia serwera")), ms); });
+  return Promise.race([obietnica, limit]).finally(() => clearTimeout(zegar));
 }
 
 async function ogloszSterowanie() {
@@ -1803,11 +1832,21 @@ async function przyjmijSterowanie(paczka) {
 function rysujSterowanie() {
   const pasek = document.getElementById("sterowanie");
   pasek.hidden = sterowanie.aktywny;
+  document.body.classList.toggle("p-podglad", !sterowanie.aktywny);
   if (sterowanie.aktywny) return;
   const przejmij = el("button", { className: "k1-btn pelny", type: "button", textContent: t("przejmij") });
   przejmij.dataset.fokus = "przejmij";
   przejmij.addEventListener("click", przejmijSterowanie);
   wstaw(pasek, el("p", { textContent: t("podglad") }), przejmij);
+}
+
+/* Kliknięcie w podglądzie niczego nie zmienia, więc pokazujemy wyraźnie, dlaczego. */
+function mrugnijPodgladem() {
+  const pasek = document.getElementById("sterowanie");
+  pasek.classList.remove("mrug");
+  void pasek.offsetWidth;
+  pasek.classList.add("mrug");
+  pasek.scrollIntoView({ block: "start", behavior: "smooth" });
 }
 
 /* naStart(): sesja gotowa. naStan(stan): stan z podpisem. naInne(temat, dane): głosy, obecność, telewizor. */
@@ -2425,6 +2464,7 @@ function ustaw(nowy) {
   if (!czyAktywny()) {
     console.warn("Podgląd: zmiana pominięta, debatę prowadzi inne urządzenie");
     rysujSterowanie();
+    mrugnijPodgladem();
     return;
   }
   if (dzwiekTutaj && czyDzwonekPrzewiniecia(stan, nowy)) zagraj("koniec").catch((b) => console.warn("Nie zagrał dźwięk", b));

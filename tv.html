@@ -933,6 +933,7 @@ if (typeof module !== "undefined") {
 /* Łącze na żywo: dwa publiczne serwery MQTT naraz, żeby awaria jednego nie zatrzymała debaty.
    Meta, stan i głosy są „retained”: serwer oddaje ostatnią wersję każdemu, kto dołączy później.
    Kanał sesji to prefiks gd/<sid> (sesja.js); sesja testowa ma własne id, więc własny kanał. */
+const PRZERWA_DO_NOWEGO_POLACZENIA_MS = 10000;
 const BROKERY = ["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt"];
 
 function czytajWiadomosc(temat, bufor) {
@@ -983,9 +984,19 @@ function polaczLacze({ prefiks, subskrypcje, naWiadomosc, naStatus, testament })
     });
   }
 
+  /* Uśpiony telefon albo tablet często wraca z martwym połączeniem, które wciąż udaje „połączone”.
+     Po dłuższej przerwie łączymy od nowa: serwer odda zachowany stan, meta i głosy. */
+  let ukrytoOd = null;
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
-    for (const klient of klienci) if (!klient.connected && !klient.reconnecting) klient.reconnect();
+    if (document.visibilityState !== "visible") {
+      ukrytoOd = Date.now();
+      return;
+    }
+    const dlugaPrzerwa = ukrytoOd !== null && Date.now() - ukrytoOd > PRZERWA_DO_NOWEGO_POLACZENIA_MS;
+    ukrytoOd = null;
+    for (const klient of klienci) {
+      if (dlugaPrzerwa || (!klient.connected && !klient.reconnecting)) klient.reconnect();
+    }
   });
 
   function zakoncz() {
